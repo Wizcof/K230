@@ -52,6 +52,13 @@ det_app.config_preprocess()
 print("初始化成功，开始 PipeLine 视频流推理与追踪...")
 
 # ================= 5. 主循环与追踪逻辑 =================
+# 在 while True 外面初始化历史偏移量和滤波系数
+last_dx, last_dy = 0, 0
+# alpha 是滤波系数 (0 < alpha <= 1)
+# alpha 越小，抗抖动能力越强，但跟随会有延迟
+# alpha 越大，跟随越灵敏，但更容易受噪声影响（建议在 0.3 - 0.7 之间调参）
+alpha = 0.5
+
 try:
     while True:
         with ScopedTiming("total", 1):
@@ -59,55 +66,35 @@ try:
             res = det_app.run(img)
 
             if res:
-                print("【调试】原始检测结果:", res)
-                # 3. 追踪与串口逻辑 (精准解析 ndarray 字典格式)
                 if isinstance(res, dict) and 'boxes' in res and len(res['boxes']) > 0:
                     largest_box = None
                     max_area = 0
 
-                    # 提取底层的检测框数组和得分数组
                     boxes = res['boxes']
-                    scores = res['scores'] if 'scores' in res else []
+                    # ... [提取 largest_box 的代码保持不变] ...
 
-                    # 遍历所有检测到的目标
-                    for i in range(len(boxes)):
-                        try:
-                            # 确保提取出的是普通数字
-                            box = boxes[i]
-                            x1 = int(box[0])
-                            y1 = int(box[1])
-                            x2 = int(box[2])
-                            y2 = int(box[3])
-
-                            # 将 [x1, y1, x2, y2] 格式转为宽和高
-                            b_w = x2 - x1
-                            b_h = y2 - y1
-
-                            # 过滤掉非法或者太小的框（比如宽或高小于0的噪点）
-                            if b_w <= 0 or b_h <= 0:
-                                continue
-
-                            # 计算面积
-                            area = b_w * b_h
-                            if area > max_area:
-                                max_area = area
-                                # 存储左上角坐标和宽高
-                                largest_box = (x1, y1, b_w, b_h)
-
-                        except Exception as e:
-                            print(f"坐标解析跳过: {e}")
-                            continue
-
-                    # 如果找到了最大的有效框，计算中心点并发送串口
                     if largest_box:
                         b_x, b_y, b_w, b_h = largest_box
-                        # 计算目标中心点 cx, cy
+
+                        # 【新增约束】：过滤掉过于离谱的比例或极小的噪点框
+                        # 比如快递盒/袋的长宽比通常不会超过 5:1，面积也不能太小
+                        if b_w / (b_h + 0.001) > 5 or b_h / (b_w + 0.001) > 5 or (b_w * b_h) < 1000:
+                            continue # 跳过这个不合理的框
+
                         cx = int(b_x + b_w // 2)
                         cy = int(b_y + b_h // 2)
 
-                        # 计算相对屏幕中心的偏移量
-                        dx = cx - CENTER_X
-                        dy = cy - CENTER_Y
+                        # 计算原始偏移量
+                        raw_dx = cx - CENTER_X
+                        raw_dy = cy - CENTER_Y
+
+                        # 【新增滤波】：应用 EMA 算法平滑坐标
+                        dx = int(alpha * raw_dx + (1 - alpha) * last_dx)
+                        dy = int(alpha * raw_dy + (1 - alpha) * last_dy)
+
+                        # 更新历史坐标
+                        last_dx = dx
+                        last_dy = dy
 
                         uart_data = f"X:{dx}, Y:{dy}\n"
 
