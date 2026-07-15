@@ -6,7 +6,7 @@
  * * 1. 💻 电脑串口调试 (通过板载 USB 线，波特率: 115200，需勾选"发送新行/加回车换行")
  * - 适用场景：精细标定每个舵机的物理角度，防止机械臂互相干涉或打齿。
  * - 指令格式 (字母+空格+数值)：
- * - B 1500 : 调整底座 (Base) 脉宽到 1500us (有效范围约 500-2500)
+ * - B 1500 : 调整底座 (Base) 脉宽到 1620us (有效范围约 500-2500)
  * - C 90   : 调整爪子 (Claw) 角度到 90度 (有效范围 0-180)
  * - M 150  : 调整中臂 (Mid) 角度到 150度 (有效范围 0-180)
  * - L 50   : 调整下臂 (Low) 角度到 50度 (有效范围 0-180)
@@ -84,9 +84,7 @@ const char *TRIGGER_CODE = "13-5-4011";
 #define LOW_LIFT 40  // 抓到物品后抬起的高度
 
 /* --- 底座冲刺脉宽 (us) --- */
-#define BASE_FORWARD_PWM 1900  // 抓取前，底座往前冲的脉宽
-#define BASE_CENTER_PWM 1500   // 底座居中脉宽
-#define BASE_BACKWARD_PWM 1150 // 抓取后，底座后退的脉宽
+
 
 /* --- 动作速度参数 --- */
 #define STEP_DELAY_MS 10 // 舵机每转动1度的等待时间(毫秒)。数字越大，动作越慢越平滑
@@ -102,8 +100,8 @@ volatile int target_x = 0;
 volatile int target_y = 0;
 const int DISTANCE_THRESHOLD = 200; // [调试指南] 视觉抓取阈值，如果离得太远就抓，把这个值调大；如果撞上了才抓，调小。
 
-volatile bool is_manual_mode = false;
-volatile int current_base_pwm = 1500;
+volatile bool is_manual_mode = true;
+volatile int current_base_pwm = 1620;
 const int MAX_PWM_STEP = 15;
 
 // ====================================================================
@@ -241,57 +239,45 @@ void smooth_move_angle(uint8_t channel, int start_angle, int end_angle, int step
 // 6. FreeRTOS 任务逻辑
 // ====================================================================
 
-void pickup_task(void *pvParameters)
-{
+void pickup_task(void *pvParameters) {
     is_pickup_running = true;
     ESP_LOGI(TAG, ">>>> 状态切换：开始抓取 <<<<");
-
+    
     // 1. 机械臂到达准备姿态
-    set_servo_angle(1, CLAW_OPEN);
-    set_servo_angle(2, MID_READY);
-    set_servo_angle(3, LOW_READY);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    set_servo_angle(1, CLAW_OPEN);  
+    set_servo_angle(2, MID_READY); 
+    set_servo_angle(3, LOW_READY);  
+    vTaskDelay(pdMS_TO_TICKS(1000));      
 
-    // 2. 缓慢下探
+    // 2. 缓慢下探 (单纯靠中臂和下臂的角度伸展去够物品)
     smooth_move_angle(2, MID_READY, MID_DOWN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
     smooth_move_angle(3, LOW_READY, LOW_DOWN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
-
+    
     // 3. 爪子合拢抓取
     smooth_move_angle(1, CLAW_OPEN, CLAW_CLOSE, STEP_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(300));
-
+    vTaskDelay(pdMS_TO_TICKS(300)); 
+    
     // 4. 抬起物品
     smooth_move_angle(3, LOW_DOWN, LOW_LIFT, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
     smooth_move_angle(2, MID_DOWN, MID_LIFT, STEP_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(300));
-
-    // 5. 底座前冲与复位缓冲
-    set_base_servo_pwm(BASE_FORWARD_PWM);
-    vTaskDelay(pdMS_TO_TICKS(1300));
-    set_base_servo_pwm(BASE_CENTER_PWM);
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 6. 放下物品并松开爪子
+    vTaskDelay(pdMS_TO_TICKS(500)); // 稍微多停顿一下，确保抬稳
+    
+    // 5. 放下物品并松开爪子
     smooth_move_angle(1, CLAW_CLOSE, CLAW_OPEN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 7. 底座后退
-    set_base_servo_pwm(BASE_BACKWARD_PWM);
-    vTaskDelay(pdMS_TO_TICKS(1300));
-    set_base_servo_pwm(BASE_CENTER_PWM);
-
-    // 8. 机械臂收回安全位置
+    
+    // 6. 机械臂收回安全位置
     smooth_move_angle(2, MID_LIFT, MID_SAFE, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
 
     ESP_LOGI(TAG, ">>>> 抓取结束，释放锁 <<<<");
-    beep(1, 800);
+    beep(1, 800); 
 
     is_pickup_running = false;
-    vTaskDelete(NULL);
+    vTaskDelete(NULL); 
 }
 void uart_pc_task(void *pvParameters)
 {
@@ -401,7 +387,7 @@ void uart_bt_task(void *pvParameters)
                     }
                     else if (cmd == 'C' || cmd == 'c')
                     { // 立刻回中
-                        current_base_pwm = 1500;
+                        current_base_pwm = 1620;
                         set_base_servo_pwm(current_base_pwm);
                     }
                     else if (cmd == 'P' || cmd == 'p')
@@ -470,7 +456,7 @@ void uart_vision_task(void *pvParameters)
                                 if (!is_pickup_running)
                                 {
                                     // 视觉 PID 跟随逻辑
-                                    int target_pwm = 1500;
+                                    int target_pwm = 1620;
                                     if (abs(target_x) > DEAD_ZONE)
                                     {
                                         int d_error = target_x - last_error_x;
@@ -480,7 +466,7 @@ void uart_vision_task(void *pvParameters)
                                             speed_offset = 400;
                                         if (speed_offset < -400)
                                             speed_offset = -400;
-                                        target_pwm = 1500 - speed_offset;
+                                        target_pwm = 1620 - speed_offset;
                                     }
                                     last_error_x = target_x;
 
@@ -516,15 +502,15 @@ void uart_vision_task(void *pvParameters)
                 if (!is_pickup_running)
                     beep(3, 50);
             }
-            if (current_base_pwm != 1500 && !is_pickup_running)
+            if (current_base_pwm != 1620 && !is_pickup_running)
             {
                 // 丢失目标后，底盘平滑归中，防止瞬间抽搐
-                if (1500 > current_base_pwm + MAX_PWM_STEP)
+                if (1620 > current_base_pwm + MAX_PWM_STEP)
                     current_base_pwm += MAX_PWM_STEP;
-                else if (1500 < current_base_pwm - MAX_PWM_STEP)
+                else if (1620 < current_base_pwm - MAX_PWM_STEP)
                     current_base_pwm -= MAX_PWM_STEP;
                 else
-                    current_base_pwm = 1500;
+                    current_base_pwm = 1620;
                 set_base_servo_pwm(current_base_pwm);
             }
         }
@@ -542,7 +528,7 @@ void app_main(void)
     init_pca9685();
 
     // [调试指南] 上电保护：开机时自动把所有舵机归零/归中，防止一通电机械臂乱甩打坏零件
-    set_servo_pulse(0, 1500); // 底座 (Base) 居中
+    set_servo_pulse(0, 1620); // 底座 (Base) 居中
     set_servo_pulse(1, 1500); // 爪子 (Claw) 中间态
     set_servo_pulse(2, 1722); // 中臂 (Mid) 垂直
     set_servo_pulse(3, 1389); // 下臂 (Low) 垂直
