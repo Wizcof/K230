@@ -80,7 +80,7 @@ const char *TRIGGER_CODE = "13-5-4011";
 
 /* --- 下臂 (Channel 3) 角度 --- */
 #define LOW_READY 50 // 准备下探的初始高度
-#define LOW_DOWN 150 // 完全降下接触物品的高度
+#define LOW_DOWN 115 // 完全降下接触物品的高度
 #define LOW_LIFT 40  // 抓到物品后抬起的高度
 
 /* --- 底座冲刺脉宽 (us) --- */
@@ -100,7 +100,7 @@ volatile int target_x = 0;
 volatile int target_y = 0;
 const int DISTANCE_THRESHOLD = 200; // [调试指南] 视觉抓取阈值，如果离得太远就抓，把这个值调大；如果撞上了才抓，调小。
 
-volatile bool is_manual_mode = true;
+volatile bool is_manual_mode = false;
 volatile int current_base_pwm = 1620;
 const int MAX_PWM_STEP = 15;
 
@@ -249,7 +249,7 @@ void pickup_task(void *pvParameters) {
     set_servo_angle(3, LOW_READY);  
     vTaskDelay(pdMS_TO_TICKS(1000));      
 
-    // 2. 缓慢下探 (单纯靠中臂和下臂的角度伸展去够物品)
+    // 2. 缓慢下探
     smooth_move_angle(2, MID_READY, MID_DOWN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
     smooth_move_angle(3, LOW_READY, LOW_DOWN, STEP_DELAY_MS);
@@ -259,21 +259,81 @@ void pickup_task(void *pvParameters) {
     smooth_move_angle(1, CLAW_OPEN, CLAW_CLOSE, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300)); 
     
-    // 4. 抬起物品
-    smooth_move_angle(3, LOW_DOWN, LOW_LIFT, STEP_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(300));
-    smooth_move_angle(2, MID_DOWN, MID_LIFT, STEP_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(500)); // 稍微多停顿一下，确保抬稳
+ // 4. 抬起物品 (优化：双臂联动，同时平滑抬起)
+    int low_start = LOW_DOWN, low_end = LOW_LIFT; 
+    int mid_start = MID_DOWN, mid_end = MID_LIFT;
     
+    // 取角度变化较大的一方作为总步数，保证最细腻的平滑度
+    int total_steps = abs(low_start - low_end); 
+    if (abs(mid_start - mid_end) > total_steps) {
+        total_steps = abs(mid_start - mid_end);
+    }
+
+    // 在同一个循环里，根据当前进度(i/total_steps)同时计算并给两个舵机发送角度
+    for (int i = 0; i <= total_steps; i++) {
+        int current_low = low_start + (low_end - low_start) * i / total_steps;
+        int current_mid = mid_start + (mid_end - mid_start) * i / total_steps;
+        
+        set_servo_angle(3, current_low);
+        set_servo_angle(2, current_mid);
+        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY_MS));
+    }
+    vTaskDelay(pdMS_TO_TICKS(500)); // 抬举到位后停顿半秒，消除机械臂末端晃动
+    
+    // ================= 【平滑转身到后方】 =================
+    ESP_LOGI(TAG, "🔄 抓取完毕，正在平滑转身到后方...");
+    
+    // 缓起步 (从 1620 逐渐加速到 1800)
+    for (int pwm = 1620; pwm <= 1800; pwm += 10) {
+        set_base_servo_pwm(pwm);
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    
+    // 保持匀速旋转
+    vTaskDelay(pdMS_TO_TICKS(2100)); 
+    
+    // 缓刹车 (从 1800 逐渐减速回 1620)
+    for (int pwm = 1800; pwm >= 1620; pwm -= 10) {
+        set_base_servo_pwm(pwm);
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    
+    set_base_servo_pwm(1620); // 确保绝对停止
+    vTaskDelay(pdMS_TO_TICKS(500)); 
+    // =========================================================
+
     // 5. 放下物品并松开爪子
     smooth_move_angle(1, CLAW_CLOSE, CLAW_OPEN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(500));
     
+    // ================= 【平滑转身复位回前方】 =================
+    ESP_LOGI(TAG, "🔄 物品已释放，保持姿态平滑转身复位中...");
+    
+    // 缓起步反转 (从 1620 逐渐加速到 1440)
+    for (int pwm = 1620; pwm >= 1440; pwm -= 10) {
+        set_base_servo_pwm(pwm);
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    
+    // 保持匀速反转
+    vTaskDelay(pdMS_TO_TICKS(1900)); 
+    
+    // 缓刹车 (从 1440 逐渐减速回 1620)
+    for (int pwm = 1440; pwm <= 1620; pwm += 10) {
+        set_base_servo_pwm(pwm);
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    
+    set_base_servo_pwm(1620); // 确保绝对停止
+    vTaskDelay(pdMS_TO_TICKS(500)); // 等待底盘惯性消除，完全停稳
+    // =========================================================
+
     // 6. 机械臂收回安全位置
+    ESP_LOGI(TAG, "🦾 底盘已回正，机械臂收回安全位置...");
     smooth_move_angle(2, MID_LIFT, MID_SAFE, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
 
-    ESP_LOGI(TAG, ">>>> 抓取结束，释放锁 <<<<");
+    ESP_LOGI(TAG, ">>>> 抓取全流程结束，释放锁 <<<<");
     beep(1, 800); 
 
     is_pickup_running = false;
