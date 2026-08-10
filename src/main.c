@@ -119,7 +119,6 @@ volatile bool is_target_lost = true;
 volatile bool is_pickup_running = false;
 volatile int target_x = 0;
 volatile int target_y = 0;
-const int DISTANCE_THRESHOLD = 200; // [调试指南] 视觉抓取阈值，如果离得太远就抓，把这个值调大；如果撞上了才抓，调小。
 
 volatile bool is_manual_mode = false;
 volatile int current_base_pwm = 1620;
@@ -621,6 +620,12 @@ void uart_vision_task(void *pvParameters)
                                 ESP_LOGI(TAG, "🚨 视觉收到指令，触发抓取！");
                                 if (!is_pickup_running)
                                 {
+                                    // [核心修复 1]：立即锁定状态，切断后方的 PID 跟随
+                                    is_pickup_running = true;
+                                    // [核心修复 2]：强制底盘立即刹车停止，防止继续旋转
+                                    current_base_pwm = 1620;
+                                    set_base_servo_pwm(1620);
+
                                     beep(2, 100);
                                     xTaskCreate(pickup_task, "pickup_task", 4096, NULL, 5, NULL);
                                 }
@@ -633,16 +638,9 @@ void uart_vision_task(void *pvParameters)
                                     is_target_lost = false;
                                     ESP_LOGI(TAG, "👀 重新锁定目标");
                                 }
-                                if (!is_pickup_running)
-                                {
-                                    // 根据纵向坐标 (距离) 触发抓取
-                                    if (target_y >= DISTANCE_THRESHOLD)
-                                    {
-                                        ESP_LOGW(TAG, "🔔 距离就绪，触发抓取！");
-                                        beep(2, 100);
-                                        xTaskCreate(pickup_task, "pickup_task", 4096, NULL, 5, NULL);
-                                    }
-                                }
+
+                                // 【已删除 target_y >= DISTANCE_THRESHOLD 的自动抓取判断】
+
                                 if (!is_pickup_running)
                                 {
                                     // 视觉 PID 跟随逻辑
@@ -706,7 +704,6 @@ void uart_vision_task(void *pvParameters)
         }
     }
 }
-
 // ====================================================================
 // 6. 系统内核入口
 // ====================================================================
