@@ -3,25 +3,35 @@
  * 🤖 物流机器人主控程序 (带详细调试注释版)
  * =========================================================================================
  * * [调试指南] - 🎮 控制方式速查表
- * * 1. 💻 电脑串口调试 (通过板载 USB 线，波特率: 115200，需勾选"发送新行/加回车换行")
+ *
+ * * 1. 💻 电脑串口调试 (通过板载 USB 线，波特率: 115200)
  * - 适用场景：精细标定每个舵机的物理角度，防止机械臂互相干涉或打齿。
- * - 指令格式 (字母+空格+数值)：
- * - B 1500 : 调整底座 (Base) 脉宽到 1620us (有效范围约 500-2500)
+ * - 指令格式 (字母+空格+数值，建议勾选"加回车换行")：
+ * - B 1500 : 调整底座 (Base) 脉宽到 1500us (有效范围约 500-2500)
  * - C 90   : 调整爪子 (Claw) 角度到 90度 (有效范围 0-180)
  * - M 150  : 调整中臂 (Mid) 角度到 150度 (有效范围 0-180)
  * - L 50   : 调整下臂 (Low) 角度到 50度 (有效范围 0-180)
  * - P      : 强制执行一次抓取全流程测试
+ *
  * * 2. 📱 蓝牙手机遥控 (连接蓝牙串口助手 APP，波特率: 9600)
- * - 适用场景：脱离电脑线缆，进行场地测试。
- * - 指令格式 (单字母，无需回车)：
- * - M (或 m) : 【模式切换】开机默认是视觉自动，按 M 切换为蓝牙手动，蜂鸣器会滴一声。
- * - L (或 l) : 【左转】底盘向左微调 (限手动模式有效)
- * - R (或 r) : 【右转】底盘向右微调 (限手动模式有效)
- * - C (或 c) : 【居中】底盘立刻回到中间位置 (1500us) (限手动模式有效)
- * - P (或 p) : 【抓取】一键触发抓取流程 (限手动模式有效)
+ * - 适用场景：脱离电脑线缆，进行脱机场地测试。
+ * - 指令格式 (新版防冲突指令，自动过滤空格和回车，支持单字母直接触发)：
+ *
+ *   【系统及动作指令】
+ * - S (或 s) : [Switch] 模式切换。开机默认视觉自动，按 S 切换为蓝牙手动，蜂鸣器提示。
+ * - P (或 p) : [Pickup] 一键触发抓取流程 (限手动模式且未在抓取时有效)。
+ *
+ *   【底盘微调指令】(限手动模式有效，类似游戏 WASD 方向键)
+ * - A (或 a) : 底盘向左步进微调。
+ * - D (或 d) : 底盘向右步进微调。
+ * - H (或 h) : [Home] 底盘立刻居中回到中间位置 (1620us)。
+ *
+ *   【精细调角指令】(支持通过蓝牙 APP 发送组合指令)
+ * - 发送 "C90" 或 "C 90" : 随时精细调整爪子到 90 度 (同理支持 B/M/L 指令)。
+ *
  * * 3. 📷 视觉自动控制 (连接摄像头模块，波特率: 115200)
- * - 适用场景：全自动寻物抓取 (需要按 M 键切回自动模式才生效)。
- * - 触发条件：收到 "X:..., Y:..." 追踪坐标，Y 大于阈值时，或直接收到特征码指令。
+ * - 适用场景：全自动寻物抓取 (需要按 S 键切回自动模式才生效)。
+ * - 触发条件：收到 "X:..., Y:..." 追踪坐标，且 Y 轴距离达到设定阈值时，或直接收到特征码指令。
  * =========================================================================================
  */
 
@@ -70,7 +80,7 @@ const char *TRIGGER_CODE = "13-5-4011";
 
 /* --- 爪子 (Channel 1) 角度 --- */
 #define CLAW_OPEN 70   // 张开角度
-#define CLAW_CLOSE 150 // 抓紧角度
+#define CLAW_CLOSE 120 // 抓紧角度
 
 /* --- 中臂 (Channel 2) 角度 --- */
 #define MID_READY 150 // 准备下探的初始高度
@@ -83,11 +93,22 @@ const char *TRIGGER_CODE = "13-5-4011";
 #define LOW_DOWN 115 // 完全降下接触物品的高度
 #define LOW_LIFT 40  // 抓到物品后抬起的高度
 
-/* --- 底座冲刺脉宽 (us) --- */
+/* --- 舵机物理极限安全限位 (防止堵转打齿) --- */
+// 通道1: 爪子 (工作区间 70~120)
+#define LIMIT_CLAW_MIN 60
+#define LIMIT_CLAW_MAX 130
 
+// 通道2: 中臂 (工作区间 100~180)
+#define LIMIT_MID_MIN 90
+#define LIMIT_MID_MAX 180
+
+// 通道3: 下臂 (工作区间 40~115)
+#define LIMIT_LOW_MIN 30
+#define LIMIT_LOW_MAX 130
 
 /* --- 动作速度参数 --- */
 #define STEP_DELAY_MS 10 // 舵机每转动1度的等待时间(毫秒)。数字越大，动作越慢越平滑
+
 // ====================================================================
 // 4. 全局状态变量
 // ====================================================================
@@ -195,10 +216,58 @@ void set_servo_pulse(uint8_t channel, uint32_t pulse_us)
  */
 void set_servo_angle(uint8_t channel, int angle)
 {
-    if (angle < 0)
-        angle = 0;
-    if (angle > 180)
-        angle = 180;
+    // 1. 根据不同通道进行独立限位拦截
+    switch (channel)
+    {
+    case 1: // 爪子 (Claw)
+        if (angle < LIMIT_CLAW_MIN)
+        {
+            ESP_LOGW(TAG, "⚠️ 触发限位：爪子角度 %d 低于下限 %d", angle, LIMIT_CLAW_MIN);
+            angle = LIMIT_CLAW_MIN;
+        }
+        else if (angle > LIMIT_CLAW_MAX)
+        {
+            ESP_LOGW(TAG, "⚠️ 触发限位：爪子角度 %d 超出上限 %d", angle, LIMIT_CLAW_MAX);
+            angle = LIMIT_CLAW_MAX;
+        }
+        break;
+
+    case 2: // 中臂 (Mid)
+        if (angle < LIMIT_MID_MIN)
+        {
+            ESP_LOGW(TAG, "⚠️ 触发限位：中臂角度 %d 低于下限 %d", angle, LIMIT_MID_MIN);
+            angle = LIMIT_MID_MIN;
+        }
+        else if (angle > LIMIT_MID_MAX)
+        {
+            ESP_LOGW(TAG, "⚠️ 触发限位：中臂角度 %d 超出上限 %d", angle, LIMIT_MID_MAX);
+            angle = LIMIT_MID_MAX;
+        }
+        break;
+
+    case 3: // 下臂 (Low)
+        if (angle < LIMIT_LOW_MIN)
+        {
+            ESP_LOGW(TAG, "⚠️ 触发限位：下臂角度 %d 低于下限 %d", angle, LIMIT_LOW_MIN);
+            angle = LIMIT_LOW_MIN;
+        }
+        else if (angle > LIMIT_LOW_MAX)
+        {
+            ESP_LOGW(TAG, "⚠️ 触发限位：下臂角度 %d 超出上限 %d", angle, LIMIT_LOW_MAX);
+            angle = LIMIT_LOW_MAX;
+        }
+        break;
+
+    default:
+        // 其他未特殊定义的通道，保留基础的 0-180 限位
+        if (angle < 0)
+            angle = 0;
+        if (angle > 180)
+            angle = 180;
+        break;
+    }
+
+    // 2. 将安全角度转换为脉宽并输出
     uint32_t pulse = 500 + (angle * 2000 / 180);
     set_servo_pulse(channel, pulse);
 }
@@ -239,92 +308,99 @@ void smooth_move_angle(uint8_t channel, int start_angle, int end_angle, int step
 // 6. FreeRTOS 任务逻辑
 // ====================================================================
 
-void pickup_task(void *pvParameters) {
+void pickup_task(void *pvParameters)
+{
     is_pickup_running = true;
     ESP_LOGI(TAG, ">>>> 状态切换：开始抓取 <<<<");
-    
+
     // 1. 机械臂到达准备姿态
-    set_servo_angle(1, CLAW_OPEN);  
-    set_servo_angle(2, MID_READY); 
-    set_servo_angle(3, LOW_READY);  
-    vTaskDelay(pdMS_TO_TICKS(1000));      
+    set_servo_angle(1, CLAW_OPEN);
+    set_servo_angle(2, MID_READY);
+    set_servo_angle(3, LOW_READY);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     // 2. 缓慢下探
     smooth_move_angle(2, MID_READY, MID_DOWN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
     smooth_move_angle(3, LOW_READY, LOW_DOWN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(300));
-    
+
     // 3. 爪子合拢抓取
     smooth_move_angle(1, CLAW_OPEN, CLAW_CLOSE, STEP_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(300)); 
-    
- // 4. 抬起物品 (优化：双臂联动，同时平滑抬起)
-    int low_start = LOW_DOWN, low_end = LOW_LIFT; 
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    // 4. 抬起物品 (优化：双臂联动，同时平滑抬起)
+    int low_start = LOW_DOWN, low_end = LOW_LIFT;
     int mid_start = MID_DOWN, mid_end = MID_LIFT;
-    
+
     // 取角度变化较大的一方作为总步数，保证最细腻的平滑度
-    int total_steps = abs(low_start - low_end); 
-    if (abs(mid_start - mid_end) > total_steps) {
+    int total_steps = abs(low_start - low_end);
+    if (abs(mid_start - mid_end) > total_steps)
+    {
         total_steps = abs(mid_start - mid_end);
     }
 
     // 在同一个循环里，根据当前进度(i/total_steps)同时计算并给两个舵机发送角度
-    for (int i = 0; i <= total_steps; i++) {
+    for (int i = 0; i <= total_steps; i++)
+    {
         int current_low = low_start + (low_end - low_start) * i / total_steps;
         int current_mid = mid_start + (mid_end - mid_start) * i / total_steps;
-        
+
         set_servo_angle(3, current_low);
         set_servo_angle(2, current_mid);
         vTaskDelay(pdMS_TO_TICKS(STEP_DELAY_MS));
     }
     vTaskDelay(pdMS_TO_TICKS(500)); // 抬举到位后停顿半秒，消除机械臂末端晃动
-    
+
     // ================= 【平滑转身到后方】 =================
     ESP_LOGI(TAG, "🔄 抓取完毕，正在平滑转身到后方...");
-    
+
     // 缓起步 (从 1620 逐渐加速到 1800)
-    for (int pwm = 1620; pwm <= 1800; pwm += 10) {
+    for (int pwm = 1620; pwm <= 1800; pwm += 10)
+    {
         set_base_servo_pwm(pwm);
         vTaskDelay(pdMS_TO_TICKS(15));
     }
-    
+
     // 保持匀速旋转
-    vTaskDelay(pdMS_TO_TICKS(2100)); 
-    
+    vTaskDelay(pdMS_TO_TICKS(2700)); // 2100  +-180
+
     // 缓刹车 (从 1800 逐渐减速回 1620)
-    for (int pwm = 1800; pwm >= 1620; pwm -= 10) {
+    for (int pwm = 1800; pwm >= 1620; pwm -= 10)
+    {
         set_base_servo_pwm(pwm);
         vTaskDelay(pdMS_TO_TICKS(15));
     }
-    
+
     set_base_servo_pwm(1620); // 确保绝对停止
-    vTaskDelay(pdMS_TO_TICKS(500)); 
+    vTaskDelay(pdMS_TO_TICKS(500));
     // =========================================================
 
     // 5. 放下物品并松开爪子
     smooth_move_angle(1, CLAW_CLOSE, CLAW_OPEN, STEP_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(500));
-    
+
     // ================= 【平滑转身复位回前方】 =================
     ESP_LOGI(TAG, "🔄 物品已释放，保持姿态平滑转身复位中...");
-    
+
     // 缓起步反转 (从 1620 逐渐加速到 1440)
-    for (int pwm = 1620; pwm >= 1440; pwm -= 10) {
+    for (int pwm = 1620; pwm >= 1440; pwm -= 10)
+    {
         set_base_servo_pwm(pwm);
         vTaskDelay(pdMS_TO_TICKS(15));
     }
-    
+
     // 保持匀速反转
-    vTaskDelay(pdMS_TO_TICKS(1900)); 
-    
+    vTaskDelay(pdMS_TO_TICKS(1900));
+
     // 缓刹车 (从 1440 逐渐减速回 1620)
-    for (int pwm = 1440; pwm <= 1620; pwm += 10) {
+    for (int pwm = 1440; pwm <= 1620; pwm += 10)
+    {
         set_base_servo_pwm(pwm);
         vTaskDelay(pdMS_TO_TICKS(15));
     }
-    
-    set_base_servo_pwm(1620); // 确保绝对停止
+
+    set_base_servo_pwm(1620);       // 确保绝对停止
     vTaskDelay(pdMS_TO_TICKS(500)); // 等待底盘惯性消除，完全停稳
     // =========================================================
 
@@ -334,10 +410,10 @@ void pickup_task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(300));
 
     ESP_LOGI(TAG, ">>>> 抓取全流程结束，释放锁 <<<<");
-    beep(1, 800); 
+    beep(1, 800);
 
     is_pickup_running = false;
-    vTaskDelete(NULL); 
+    vTaskDelete(NULL);
 }
 void uart_pc_task(void *pvParameters)
 {
@@ -414,54 +490,108 @@ void uart_pc_task(void *pvParameters)
 void uart_bt_task(void *pvParameters)
 {
     uint8_t bt_data[128];
+    char line_buf[128];
+
     while (1)
     {
         int len = uart_read_bytes(BT_UART_PORT, bt_data, sizeof(bt_data) - 1, pdMS_TO_TICKS(50));
         if (len > 0)
         {
-            bt_data[len] = '\0';
+            // 1. 净化数据：剔除换行符(\r\n)和空格( )，将 "C 90\n" 变成 "C90"
+            int pos = 0;
             for (int i = 0; i < len; i++)
             {
-                char cmd = bt_data[i];
-
-                // M 键：用来强制夺权。防止视觉追踪一直在发指令导致你遥控不了
-                if (cmd == 'M' || cmd == 'm')
+                if (bt_data[i] != '\n' && bt_data[i] != '\r' && bt_data[i] != ' ')
                 {
-                    is_manual_mode = !is_manual_mode;
-                    ESP_LOGI(TAG, "切换模式: %s", is_manual_mode ? "手动" : "自动(视觉)");
-                    beep(1, 200);
+                    line_buf[pos++] = (char)bt_data[i];
+                }
+            }
+            line_buf[pos] = '\0';
+
+            if (pos > 0)
+            {
+                // 2. 提取指令首字母并统一转换为大写
+                char cmd = line_buf[0];
+                if (cmd >= 'a' && cmd <= 'z')
+                    cmd -= 32;
+
+                // 3. 提取可能存在的数字参数 (如果只有字母，atoi 会安全地返回 0)
+                int val = 0;
+                if (pos > 1)
+                {
+                    val = atoi(&line_buf[1]);
                 }
 
-                // 以下四个遥控按键，必须在手动模式下才有效
-                if (is_manual_mode && !is_pickup_running)
+                // 4. 极简的 switch 路由分支
+                switch (cmd)
                 {
-                    if (cmd == 'L' || cmd == 'l')
-                    { // 左微调 (底座步进+50)
-                        current_base_pwm += 50;
-                        set_base_servo_pwm(current_base_pwm);
-                    }
-                    else if (cmd == 'R' || cmd == 'r')
-                    { // 右微调 (底座步进-50)
-                        current_base_pwm -= 50;
-                        set_base_servo_pwm(current_base_pwm);
-                    }
-                    else if (cmd == 'C' || cmd == 'c')
-                    { // 立刻回中
-                        current_base_pwm = 1620;
-                        set_base_servo_pwm(current_base_pwm);
-                    }
-                    else if (cmd == 'P' || cmd == 'p')
-                    { // 强制触发抓取
+                // === 系统与动作类 (无参数) ===
+                case 'S': // 切换模式 (原 M)
+                    is_manual_mode = !is_manual_mode;
+                    ESP_LOGI(TAG, "📱 模式: %s", is_manual_mode ? "手动" : "自动");
+                    beep(1, 200);
+                    break;
+
+                case 'P': // 触发抓取
+                    if (is_manual_mode && !is_pickup_running)
+                    {
                         ESP_LOGI(TAG, "✋ 蓝牙遥控，触发抓取！");
                         beep(2, 100);
                         xTaskCreate(pickup_task, "pickup_task", 4096, NULL, 5, NULL);
                     }
+                    break;
+
+                // === 底盘微调类 (无参数) ===
+                case 'A': // 左转 (原 L)
+                    if (is_manual_mode && !is_pickup_running)
+                    {
+                        current_base_pwm += 50;
+                        set_base_servo_pwm(current_base_pwm);
+                    }
+                    break;
+
+                case 'D': // 右转 (原 R)
+                    if (is_manual_mode && !is_pickup_running)
+                    {
+                        current_base_pwm -= 50;
+                        set_base_servo_pwm(current_base_pwm);
+                    }
+                    break;
+
+                case 'H': // 居中 (原 C)
+                    if (is_manual_mode && !is_pickup_running)
+                    {
+                        current_base_pwm = 1620;
+                        set_base_servo_pwm(current_base_pwm);
+                        ESP_LOGI(TAG, "📱 蓝牙: 底盘回中");
+                    }
+                    break;
+
+                // === 舵机精调类 (需携带 val 参数) ===
+                case 'B': // 调底座
+                    if (!is_pickup_running)
+                        set_base_servo_pwm(val);
+                    break;
+
+                case 'C': // 调爪子
+                    if (!is_pickup_running)
+                        set_servo_angle(1, val);
+                    break;
+
+                case 'M': // 调中臂
+                    if (!is_pickup_running)
+                        set_servo_angle(2, val);
+                    break;
+
+                case 'L': // 调下臂
+                    if (!is_pickup_running)
+                        set_servo_angle(3, val);
+                    break;
                 }
             }
         }
     }
 }
-
 void uart_vision_task(void *pvParameters)
 {
     uint8_t *cam_data = (uint8_t *)malloc(BUF_SIZE);
