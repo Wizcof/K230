@@ -718,10 +718,10 @@ void app_main(void)
     init_pca9685();
 
     // [调试指南] 上电保护：开机时自动把所有舵机归零/归中，防止一通电机械臂乱甩打坏零件
-    set_servo_pulse(0, 1620); // 底座 (Base) 居中
-    set_servo_pulse(1, 1500); // 爪子 (Claw) 中间态
-    set_servo_pulse(2, 1722); // 中臂 (Mid) 垂直
-    set_servo_pulse(3, 1389); // 下臂 (Low) 垂直
+    set_base_servo_pwm(1620);      // 底座 (Base) 居中 (1620us)
+    set_servo_angle(1, CLAW_OPEN); // 爪子 (Claw) 保持张开准备状态
+    set_servo_angle(2, MID_SAFE);  // 中臂 (Mid) 收回至安全高度
+    set_servo_angle(3, LOW_LIFT);  // 下臂 (Low) 保持抬起收缩状态
 
     // 初始化电脑串口
     uart_driver_install(PC_UART_PORT, BUF_SIZE * 2, 0, 0, NULL, 0);
